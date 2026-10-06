@@ -228,6 +228,8 @@ cat /proc/asound/cards
 | `ALSA_FIX_AUTO_MUTE` | `true` | 启动强制关闭 Auto-Mute 静音陷阱 |
 | `ALSA_AUTO_MUTE_CONTROL` | `Auto-Mute Mode` | Auto-Mute 控制名 |
 | `ALSA_MASTER_CONTROL` / `ALSA_HEADPHONE_CONTROL` / `ALSA_SPEAKER_CONTROL` | `Master` / `Headphone` / `Speaker` | 启动解静音的控制名 |
+| `ALSA_VOLUME_CURVE` | 空（走原来的 `%`） | 可选：把 SET_VOLUME 改成按 dB 下发。`amixer` 的 `%` 是把百分比线性映射到控件的原始刻度（ALC269VB 的 Headphone 是 0..87 步 × 0.75 dB，所以 30% 只有 -45.75 dB，中段像没声音）。写法 `0:-60,30:-30,50:-20,80:-10,100:0`（percent:dB，至少两点、必须 0→100、dB≤0，段间按 dB 线性插值）；未设置时与上游行为完全一致。需要控件支持 dB |
+| `ALSA_MUTE_SPEAKER` | `false` | 置 `true` 时启动即静音内置喇叭（ALC269VB 等插 3.5mm 不会自动静音内置喇叭，否则会内外同时出声） |
 | `AMIXER_PATH` | `amixer` | alsa-utils 混音器路径 |
 | `MPD_BINARY` | `mpd` | 播放内核路径 |
 | `MPD_CONF_PATH` | `/etc/mpd.conf` | 渲染后的 MPD 配置路径 |

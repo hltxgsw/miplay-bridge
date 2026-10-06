@@ -129,7 +129,7 @@ func TestPipelineLifecycleWithoutBinaries(t *testing.T) {
 	cfg.AplayPath = "/nonexistent/aplay-for-test"
 	pipeline := NewPipeline(cfg, discardLogger())
 
-	if err := pipeline.Start(); err == nil {
+	if err := pipeline.Start("test-session"); err == nil {
 		t.Fatal("Start must fail when the child binaries are missing")
 	}
 	if pipeline.Running() {
@@ -142,4 +142,73 @@ func TestPipelineLifecycleWithoutBinaries(t *testing.T) {
 	if stats := pipeline.Stats(); stats.Running || stats.FFmpegAlive || stats.AplayAlive {
 		t.Fatalf("stats = %+v", stats)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// MIPLAY_FFMPEG_AF（可选过滤器链）—— 2026-10-05 卡顿排查用的实验开关
+//
+// 默认不设 = 与上游命令行逐字一致，这是硬要求：这个开关只用来做一次 A/B
+// 实验（区分"率差/时钟漂移"与"数据空洞"），绝不能默认改变播放行为。
+// ---------------------------------------------------------------------------
+
+func assertArgsEqual(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("argv length %d != %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q\ngot:  %v\nwant: %v",
+				i, got[i], want[i], got, want)
+		}
+	}
+}
+
+func TestFFmpegCommandArgsDefaultMatchesUpstream(t *testing.T) {
+	cfg := config.Default()
+	cfg.MiPlayFFmpegAF = ""
+	want := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-f", "mpegts",
+		"-flags", "low_delay",
+		"-probesize", "4096",
+		"-analyzeduration", "0",
+		"-i", "pipe:0",
+		"-vn",
+		"-acodec", "pcm_s16le",
+		"-ar", "48000",
+		"-ac", "2",
+		"-f", "s16le",
+		"pipe:1",
+	}
+	assertArgsEqual(t, ffmpegCommandArgs(cfg), want)
+}
+
+func TestFFmpegCommandArgsInsertFiltersBeforeTheOutput(t *testing.T) {
+	cfg := config.Default()
+	cfg.MiPlayFFmpegAF = "aresample=async=1:min_hard_comp=0.02"
+	args := ffmpegCommandArgs(cfg)
+
+	afIndex, outputIndex := -1, -1
+	for i, arg := range args {
+		if arg == "-af" && afIndex < 0 {
+			afIndex = i
+		}
+		if arg == "s16le" && i > 0 && args[i-1] == "-f" && outputIndex < 0 {
+			outputIndex = i
+		}
+	}
+	if afIndex < 0 {
+		t.Fatalf("no -af in %v", args)
+	}
+	if outputIndex < 0 || afIndex > outputIndex {
+		t.Fatalf("-af must precede the output specifiers: %v", args)
+	}
+	if got := args[afIndex+1]; got != cfg.MiPlayFFmpegAF {
+		t.Fatalf("filter chain = %q, want %q", got, cfg.MiPlayFFmpegAF)
+	}
+	// 去掉这一对参数后，必须与默认逐字一致（即"只多了一个 -af"）。
+	stripped := append(append([]string{}, args[:afIndex]...), args[afIndex+2:]...)
+	assertArgsEqual(t, stripped, ffmpegCommandArgs(config.Default()))
 }

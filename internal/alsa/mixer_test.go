@@ -334,3 +334,89 @@ func TestInitToleratesCardsWithoutAnyHardwareMixer(t *testing.T) {
 		t.Fatal("state.Verified must be true when falling back to software volume")
 	}
 }
+
+func TestVolumeCurveDBMapping(t *testing.T) {
+	curve := []config.VolumeCurvePoint{
+		{Percent: 0, DB: -60},
+		{Percent: 30, DB: -30},
+		{Percent: 50, DB: -20},
+		{Percent: 80, DB: -10},
+		{Percent: 100, DB: 0},
+	}
+	cases := []struct {
+		percent int
+		want    string
+	}{
+		{0, "-60dB"},   // 下端点
+		{30, "-30dB"},  // 中间断点
+		{50, "-20dB"},  // 中间断点
+		{80, "-10dB"},  // 中间断点
+		{100, "0dB"},   // 上端点
+		{15, "-45dB"},  // 断点之间线性插值
+		{-10, "-60dB"}, // 下越界 clamp 到 0%
+		{150, "0dB"},   // 上越界 clamp 到 100%
+	}
+	for _, testCase := range cases {
+		got, ok := volumeCurveDB(curve, testCase.percent)
+		if !ok || got != testCase.want {
+			t.Errorf("percent %d => (%q, %v), want %q", testCase.percent, got, ok, testCase.want)
+		}
+	}
+}
+
+func TestVolumeCurveDBDisabled(t *testing.T) {
+	if got, ok := volumeCurveDB(nil, 50); ok || got != "" {
+		t.Fatalf("nil curve => (%q, %v), want empty and false", got, ok)
+	}
+	single := []config.VolumeCurvePoint{{Percent: 0, DB: -60}}
+	if got, ok := volumeCurveDB(single, 50); ok || got != "" {
+		t.Fatalf("single-point curve => (%q, %v), want empty and false", got, ok)
+	}
+}
+
+func TestSetVolumeWritesDBWhenCurveConfigured(t *testing.T) {
+	cfg := testConfig()
+	cfg.VolumeCurve = []config.VolumeCurvePoint{
+		{Percent: 0, DB: -60}, {Percent: 30, DB: -30}, {Percent: 50, DB: -20},
+		{Percent: 80, DB: -10}, {Percent: 100, DB: 0},
+	}
+	fake := newFakeAmixer()
+	mixer := New(cfg, testLogger()).WithRunner(fake.run)
+	if _, err := mixer.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mixer.SetVolume(context.Background(), 50); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	joined := strings.Join(fake.calls, "\n")
+	fake.mu.Unlock()
+	// 回归：负 dB 必须以 "--" 与选项分隔，否则 amixer 报 "invalid option -- '2'"
+	// 并静默失败（实测 amixer 1.2.14）。
+	if !strings.Contains(joined, "sset Headphone -- -20dB unmute") {
+		t.Fatalf("配置曲线后应以 '-- -20dB' 下发，实际调用:\n%s", joined)
+	}
+	if strings.Contains(joined, "sset Headphone 50%") {
+		t.Fatalf("配置曲线后不应再以 %% 下发:\n%s", joined)
+	}
+}
+
+func TestSetVolumeKeepsPercentWithoutCurve(t *testing.T) {
+	fake := newFakeAmixer()
+	mixer := New(testConfig(), testLogger()).WithRunner(fake.run)
+	if _, err := mixer.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mixer.SetVolume(context.Background(), 50); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	joined := strings.Join(fake.calls, "\n")
+	fake.mu.Unlock()
+	if !strings.Contains(joined, "sset Headphone 50%") {
+		t.Fatalf("未配置曲线时必须保持上游 %% 行为，实际调用:\n%s", joined)
+	}
+	if strings.Contains(joined, "dB") || strings.Contains(joined, " -- ") {
+		t.Fatalf("未配置曲线时不应出现 dB 或 --:\n%s", joined)
+	}
+}

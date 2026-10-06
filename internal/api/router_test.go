@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -954,5 +956,96 @@ func TestResolvePlayURI(t *testing.T) {
 		if got != testCase.want {
 			t.Fatalf("resolvePlayURI(%q, %q) = %q, want %q", testCase.raw, testCase.musicDirectory, got, testCase.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE (/api/events)
+// ---------------------------------------------------------------------------
+
+// readEvent reads one Server-Sent Event frame and decodes its JSON payload.
+func readEvent(t *testing.T, reader *bufio.Reader) map[string]any {
+	t.Helper()
+	data := ""
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE frame: %v (collected %q)", err, data)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if data == "" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(data), &payload); err != nil {
+				t.Fatalf("decode SSE payload %q: %v", data, err)
+			}
+			return payload
+		}
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+	}
+}
+
+func TestEventsStreamsStatusFrames(t *testing.T) {
+	h := newHarness(t)
+	server := httptest.NewServer(h.routes())
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.StatusCode)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("content-type = %q, want text/event-stream", got)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache-control = %q, want no-store", got)
+	}
+
+	reader := bufio.NewReader(response.Body)
+	// The first frame must arrive immediately: the console's first paint must
+	// not wait for a tick.
+	first := readEvent(t, reader)
+	if first["success"] != true {
+		t.Fatalf("first frame = %v", first)
+	}
+	if _, ok := first["miplay"].(map[string]any); !ok {
+		t.Fatalf("first frame carries no miplay slice: %v", first)
+	}
+	// A second frame proves this is a live stream rather than a one-shot body
+	// that closes immediately.
+	second := readEvent(t, reader)
+	if second["active_source"] != "idle" {
+		t.Fatalf("second frame = %v", second)
+	}
+}
+
+func TestEventsRequiresToken(t *testing.T) {
+	h := newHarness(t, func(cfg *config.Config) { cfg.Token = "s3cret" })
+	server := httptest.NewServer(h.routes())
+	t.Cleanup(server.Close)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get(server.URL + "/api/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", response.StatusCode)
 	}
 }

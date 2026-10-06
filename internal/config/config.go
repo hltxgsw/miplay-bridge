@@ -53,6 +53,14 @@ type Config struct {
 	SpeakerControl   string
 	// DefaultVolume is applied to the master control on startup (percent).
 	DefaultVolume int
+	// MuteSpeaker keeps the built-in speaker path off after startup. Needed on
+	// ALC269VB-class codecs where a plugged 3.5mm jack does not mute the internal
+	// speakers, so a cast would otherwise play from both.
+	MuteSpeaker bool
+	// VolumeCurve, when set, makes the SET_VOLUME path drive the effective control
+	// in dB instead of percent. Empty keeps the upstream percent behaviour. See
+	// ALSA_VOLUME_CURVE in README.md.
+	VolumeCurve []VolumeCurvePoint
 	// FixAutoMute can be turned off for exotic sound cards that reject the
 	// control. Default true: the fix is mandatory on the verified hardware.
 	FixAutoMute bool
@@ -101,6 +109,15 @@ type Config struct {
 	// latency knob of the realtime pipeline. 200ms absorbs Wi-Fi jitter while
 	// staying interactive.
 	MiPlayAlsaBufferUS int
+	// MiPlayFFmpegAF is an optional ffmpeg filter chain for the realtime
+	// pipeline. Empty (the default) keeps the upstream behaviour exactly:
+	// ffmpeg already inserts a resampler implicitly because we force
+	// -ar 48000, but without async compensation, so any difference between the
+	// phone's sample clock and the ALSA clock accumulates in the aplay ring.
+	// Setting it to e.g. "aresample=async=1:min_hard_comp=0.02" turns that
+	// compensation on. It is an experiment/robustness knob -- it cannot make a
+	// stalled source produce audio during the stall.
+	MiPlayFFmpegAF string
 	// FFmpegPath is the MPEG-TS/AAC decoder binary of the realtime pipeline.
 	FFmpegPath string
 	// AplayPath is the raw-PCM ALSA output binary of the realtime pipeline.
@@ -126,6 +143,13 @@ type Config struct {
 
 	// LogLevel is one of debug, info, warn, error.
 	LogLevel string
+}
+
+// VolumeCurvePoint is one breakpoint of the optional percent->dB volume curve.
+// The curve is interpolated linearly in dB between consecutive points.
+type VolumeCurvePoint struct {
+	Percent int
+	DB      int
 }
 
 // Default returns the built-in defaults verified against the target host.
@@ -216,8 +240,18 @@ func Load() (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("ALSA_SPEAKER_CONTROL")); v != "" {
 		cfg.SpeakerControl = v
 	}
+	if err := parseBoolEnv("ALSA_MUTE_SPEAKER", &cfg.MuteSpeaker); err != nil {
+		return cfg, err
+	}
 	if err := parseIntEnv("ALSA_DEFAULT_VOLUME", &cfg.DefaultVolume, 0, 100); err != nil {
 		return cfg, err
+	}
+	if v := strings.TrimSpace(os.Getenv("ALSA_VOLUME_CURVE")); v != "" {
+		curve, err := ParseVolumeCurve(v)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.VolumeCurve = curve
 	}
 	if err := parseBoolEnv("ALSA_FIX_AUTO_MUTE", &cfg.FixAutoMute); err != nil {
 		return cfg, err
@@ -274,6 +308,9 @@ func Load() (Config, error) {
 	if err := parseIntEnv("MIPLAY_ALSA_BUFFER_US", &cfg.MiPlayAlsaBufferUS, 10000, 2000000); err != nil {
 		return cfg, err
 	}
+	// Optional: no default, so an unset variable leaves the pipeline byte-for-byte
+	// identical to the upstream command line.
+	cfg.MiPlayFFmpegAF = strings.TrimSpace(os.Getenv("MIPLAY_FFMPEG_AF"))
 	if v := strings.TrimSpace(os.Getenv("FFMPEG_PATH")); v != "" {
 		cfg.FFmpegPath = v
 	}
@@ -329,6 +366,46 @@ func parseSecondsEnv(name string, target *time.Duration, min, max int) error {
 	}
 	*target = time.Duration(seconds) * time.Second
 	return nil
+}
+
+// ParseVolumeCurve parses an ALSA_VOLUME_CURVE spec such as
+// "0:-60,30:-30,50:-20,80:-10,100:0" into linear-in-dB breakpoints.
+//
+// The spec must start at 0, end at 100 and increase strictly, otherwise the
+// mapping would be ambiguous; dB must not be positive (this is an attenuator).
+// Whether the card can actually reach a requested attenuation is reported by
+// amixer at write time, not guessed here.
+func ParseVolumeCurve(spec string) ([]VolumeCurvePoint, error) {
+	fields := strings.Split(spec, ",")
+	points := make([]VolumeCurvePoint, 0, len(fields))
+	for _, field := range fields {
+		percentText, dbText, ok := strings.Cut(strings.TrimSpace(field), ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid ALSA_VOLUME_CURVE entry %q (want percent:dB)", field)
+		}
+		percent, err := strconv.Atoi(strings.TrimSpace(percentText))
+		if err != nil || percent < 0 || percent > 100 {
+			return nil, fmt.Errorf("invalid ALSA_VOLUME_CURVE percent %q", percentText)
+		}
+		db, err := strconv.Atoi(strings.TrimSpace(dbText))
+		if err != nil {
+			return nil, fmt.Errorf("invalid ALSA_VOLUME_CURVE dB %q", dbText)
+		}
+		if db > 0 {
+			return nil, fmt.Errorf("ALSA_VOLUME_CURVE dB must not be positive: %q", field)
+		}
+		if len(points) > 0 && percent <= points[len(points)-1].Percent {
+			return nil, fmt.Errorf("ALSA_VOLUME_CURVE percentages must increase: %q", spec)
+		}
+		points = append(points, VolumeCurvePoint{Percent: percent, DB: db})
+	}
+	if len(points) < 2 {
+		return nil, fmt.Errorf("ALSA_VOLUME_CURVE needs at least two points")
+	}
+	if points[0].Percent != 0 || points[len(points)-1].Percent != 100 {
+		return nil, fmt.Errorf("ALSA_VOLUME_CURVE must start at 0 and end at 100")
+	}
+	return points, nil
 }
 
 func parseBoolEnv(name string, target *bool) error {

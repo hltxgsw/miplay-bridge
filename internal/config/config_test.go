@@ -128,3 +128,91 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestParseVolumeCurve(t *testing.T) {
+	points, err := ParseVolumeCurve("0:-60,30:-30,50:-20,80:-10,100:0")
+	if err != nil {
+		t.Fatalf("ParseVolumeCurve: %v", err)
+	}
+	want := []VolumeCurvePoint{{0, -60}, {30, -30}, {50, -20}, {80, -10}, {100, 0}}
+	if len(points) != len(want) {
+		t.Fatalf("points = %v, want %v", points, want)
+	}
+	for index := range want {
+		if points[index] != want[index] {
+			t.Fatalf("points[%d] = %v, want %v", index, points[index], want[index])
+		}
+	}
+}
+
+func TestParseVolumeCurveRejects(t *testing.T) {
+	for _, spec := range []string{
+		"",                          // 空串
+		"0:-60",                     // 只有一个点
+		"10:-60,100:0",              // 未从 0 起
+		"0:-60,90:0",                // 未到 100
+		"0:-60,30:-30,30:-20,100:0", // 百分比不递增
+		"0:-60,x:0",                 // dB 非数字
+		"abc",                       // 缺少冒号
+		"0:5,100:0",                 // dB 为正（这是衰减器）
+		"0:-60,101:0",               // 百分比越界
+	} {
+		if _, err := ParseVolumeCurve(spec); err == nil {
+			t.Errorf("ParseVolumeCurve(%q) must fail", spec)
+		}
+	}
+}
+
+func TestDefaultVolumeCurveIsUpstream(t *testing.T) {
+	if len(Default().VolumeCurve) != 0 {
+		t.Fatal("VolumeCurve must default to empty: upstream percent behaviour")
+	}
+}
+
+func TestLoadReadsVolumeCurve(t *testing.T) {
+	t.Setenv("ALSA_VOLUME_CURVE", "0:-60,100:0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.VolumeCurve) != 2 || cfg.VolumeCurve[0].DB != -60 || cfg.VolumeCurve[1].Percent != 100 {
+		t.Fatalf("VolumeCurve = %v", cfg.VolumeCurve)
+	}
+}
+
+func TestLoadRejectsBadVolumeCurve(t *testing.T) {
+	t.Setenv("ALSA_VOLUME_CURVE", "oops")
+	if _, err := Load(); err == nil {
+		t.Fatal("a malformed ALSA_VOLUME_CURVE must fail Load")
+	}
+}
+
+// 可选 ffmpeg 过滤器链（卡顿排查用的实验开关）：默认必须为空。
+func TestDefaultLeavesTheOptionalFFmpegFiltersUnset(t *testing.T) {
+	if got := Default().MiPlayFFmpegAF; got != "" {
+		t.Fatalf("Default().MiPlayFFmpegAF = %q, want empty", got)
+	}
+}
+
+func TestLoadReadsOptionalFFmpegFilters(t *testing.T) {
+	t.Setenv("MIPLAY_FFMPEG_AF", "  aresample=async=1:min_hard_comp=0.02  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := "aresample=async=1:min_hard_comp=0.02"
+	if cfg.MiPlayFFmpegAF != want {
+		t.Fatalf("MiPlayFFmpegAF = %q, want %q", cfg.MiPlayFFmpegAF, want)
+	}
+}
+
+func TestLoadTreatsBlankFFmpegFiltersAsUnset(t *testing.T) {
+	t.Setenv("MIPLAY_FFMPEG_AF", "   ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MiPlayFFmpegAF != "" {
+		t.Fatalf("a blank MIPLAY_FFMPEG_AF must stay unset, got %q", cfg.MiPlayFFmpegAF)
+	}
+}

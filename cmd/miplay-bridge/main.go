@@ -261,17 +261,33 @@ func run() error {
 
 // miplayHooks connect the MiPlay receiver to the arbitration engine. The
 // engine is the single authority on who owns the sound card; the receiver
-// only ever asks.
+// only ever asks -- and hands over the teardown the engine needs to preempt it.
 func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
+	// A cast is identified by its peer (the phone) and by a per-session token:
+	// the peer decides "newcomer or reconnect", the token decides "may this
+	// unwinding session still free the slot?".
+	holderFor := func(req miplay.ClaimRequest) output.Holder {
+		return output.Holder{
+			Source: output.SourceMiPlay,
+			Peer:   req.Peer,
+			Token:  req.Token,
+		}
+	}
 	return miplay.Hooks{
-		Claim: func() error {
-			if err := engine.Claim(output.SourceMiPlay); err != nil {
+		Claim: func(ctx context.Context, req miplay.ClaimRequest) error {
+			holder := holderFor(req)
+			holder.Evict = req.Evict
+			if err := engine.Acquire(ctx, holder); err != nil {
 				return fmt.Errorf("%w: %v", miplay.ErrDeviceBusy, err)
 			}
 			return nil
 		},
-		Release: func() {
-			engine.Release(output.SourceMiPlay)
+		Release: func(peer, token string) {
+			engine.ReleaseHolder(output.Holder{
+				Source: output.SourceMiPlay,
+				Peer:   peer,
+				Token:  token,
+			})
 		},
 		SetVolume: func(percent int) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

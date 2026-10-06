@@ -39,6 +39,142 @@ const (
 // "transition not available" fault.
 var ErrSourceBusy = errors.New("the sound card is held by another source")
 
+// Holder is one claimant of the exclusive sound card.
+//
+// The ALSA device has no software mixing, so exactly one writer may exist at a
+// time. Holder carries two identities on purpose, because they answer two
+// different questions that both used to go wrong on the live box:
+//
+//   - Peer answers "is this the same sender coming back?" -- a phone
+//     reconnecting must not be treated as a newcomer and evicted.
+//   - Token answers "is this still the same session?" -- a session that was
+//     superseded unwinds later and must not free the slot its successor holds.
+type Holder struct {
+	Source Source
+	// Peer identifies the sender (for MiPlay, the phone address).
+	Peer string
+	// Token identifies this session instance.
+	Token string
+	// Evict releases the card on behalf of this holder. It MUST return only
+	// after the device is genuinely free (child processes reaped), otherwise
+	// the successor races into "Resource busy". A nil Evict means "stop the
+	// playback kernel", which is what the DLNA source needs.
+	Evict func(ctx context.Context) error
+}
+
+func (h Holder) peer() string {
+	if h.Peer != "" {
+		return h.Peer
+	}
+	return string(h.Source)
+}
+
+func (h Holder) token() string {
+	if h.Token != "" {
+		return h.Token
+	}
+	return string(h.Source)
+}
+
+// Acquire takes the sound card for h, preempting whoever holds it.
+//
+// Hand-offs are serialised and the eviction happens with the arbitration lock
+// released (it can take seconds), so a newcomer waits for the previous writer
+// to actually let go instead of colliding with it.
+func (e *Engine) Acquire(ctx context.Context, h Holder) error {
+	if h.Source == SourceIdle {
+		return errors.New("the idle source cannot claim the sound card")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	e.handoff.Lock()
+	defer e.handoff.Unlock()
+
+	e.mu.Lock()
+	victimSource, victimPeer, victimToken, victimEvict := e.active, e.holderPeer, e.holderToken, e.evict
+	e.mu.Unlock()
+
+	samePeer := victimSource != SourceIdle && victimSource == h.Source && victimPeer == h.peer()
+	if victimSource == SourceIdle || samePeer {
+		// Free, or the same sender re-claiming: adopt/refresh without eviction.
+		e.mu.Lock()
+		e.setHolderLocked(h)
+		e.mu.Unlock()
+		return nil
+	}
+
+	if err := e.evictHolder(ctx, victimSource, victimEvict); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	// Only drop the slot if the holder is still the one we just evicted; its own
+	// Release may already have cleared it, and something else must not be wiped.
+	if e.active == victimSource && e.holderToken == victimToken {
+		e.active = SourceIdle
+		e.holderPeer = ""
+		e.holderToken = ""
+		e.evict = nil
+	}
+	e.setHolderLocked(h)
+	e.mu.Unlock()
+	return nil
+}
+
+// evictHolder stops the current writer and waits for the device to be free.
+func (e *Engine) evictHolder(ctx context.Context, source Source, evict func(context.Context) error) error {
+	e.logger.Info("preempting the current sound card holder", "source", source)
+	stop := evict
+	if stop == nil {
+		stop = e.stopKernelForHandoff
+	}
+	if err := stop(ctx); err != nil {
+		return fmt.Errorf("could not release the sound card from %s: %w", source, err)
+	}
+	return nil
+}
+
+// stopKernelForHandoff halts the playback kernel and waits until it reports a
+// non-playing state, so the ALSA device is released before a hand-off.
+func (e *Engine) stopKernelForHandoff(ctx context.Context) error {
+	if e.client == nil {
+		return nil
+	}
+	if err := e.client.Stop(ctx); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state, err := e.kernelState()
+		if err != nil {
+			// An unreachable kernel cannot be streaming through us; treat the
+			// successful Stop above as sufficient.
+			return nil
+		}
+		if state != "play" && state != "pause" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+func (e *Engine) setHolderLocked(h Holder) {
+	e.active = h.Source
+	e.holderPeer = h.peer()
+	e.holderToken = h.token()
+	e.evict = h.Evict
+	e.stopStreak = 0
+	e.logger.Info("sound card claimed",
+		"source", h.Source, "peer", h.peer(), "token", h.token(), "preemptive", h.Evict != nil)
+}
+
 // PlaybackInfo is the unified playback snapshot.
 type PlaybackInfo struct {
 	// State is the kernel transport state: play, pause, stop or unknown.
@@ -87,6 +223,17 @@ type Engine struct {
 
 	mu     sync.Mutex
 	active Source
+	// holderPeer identifies the sender among senders of the same Source (two
+	// phones casting MiPlay are two peers of one Source).
+	holderPeer string
+	// holderToken identifies the session instance, so a superseded session
+	// unwinding late cannot free its successor's slot.
+	holderToken string
+	// evict is the current holder's teardown; nil means "stop the kernel".
+	evict func(ctx context.Context) error
+	// handoff serialises hand-offs. It is held across the eviction wait, which
+	// happens with mu released.
+	handoff sync.Mutex
 	// stopStreak counts consecutive monitor ticks that observed a stopped
 	// kernel while dlna/api held the slot. Two in a row release it: one lone
 	// "stop" is a normal step inside Clear -> Add -> Play.
@@ -122,8 +269,13 @@ func (e *Engine) Manager() *mpd.Manager { return e.manager }
 // Arbitration
 // ---------------------------------------------------------------------------
 
-// Claim reserves the card for one source. MiPlay additionally verifies that
-// the kernel is not mid-stream, covering a lost release.
+// Claim reserves the card for one source, refusing when another source already
+// holds it. MiPlay additionally verifies that the kernel is not mid-stream,
+// covering a lost release.
+//
+// This is the non-preemptive path (the HTTP API and the test tone): a busy card
+// answers "busy" instead of interrupting whoever is playing. The cast sources
+// (MiPlay, DLNA) go through Acquire, which takes over.
 func (e *Engine) Claim(source Source) error {
 	if source == SourceIdle {
 		return errors.New("the idle source cannot claim the sound card")
@@ -141,17 +293,26 @@ func (e *Engine) Claim(source Source) error {
 			return fmt.Errorf("%w: the playback kernel is still streaming", ErrSourceBusy)
 		}
 	}
-	e.active = source
-	e.stopStreak = 0
-	e.logger.Info("sound card claimed", "source", source)
+	e.setHolderLocked(Holder{Source: source})
 	return nil
 }
 
 // Release frees the slot when the given source still owns it. Idempotent.
 func (e *Engine) Release(source Source) {
+	e.ReleaseHolder(Holder{Source: source})
+}
+
+// ReleaseHolder frees the slot only when that exact session still owns it.
+// Token-matched on purpose: a cast that was preempted (or whose phone
+// reconnected) unwinds after the fact, and must not evict the cast that
+// replaced it.
+func (e *Engine) ReleaseHolder(h Holder) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.releaseLocked(source)
+	if e.active != h.Source || e.holderToken != h.token() {
+		return
+	}
+	e.releaseLocked(h.Source)
 }
 
 // ReleaseSource forces the slot back to idle regardless of the owner and
@@ -169,8 +330,21 @@ func (e *Engine) releaseLocked(source Source) {
 		return
 	}
 	e.active = SourceIdle
+	e.holderPeer = ""
+	e.holderToken = ""
+	e.evict = nil
 	e.stopStreak = 0
 	e.logger.Info("sound card released", "source", source)
+}
+
+// CurrentHolder returns the token of the session that currently owns the card
+// ("" when idle). Two casts of the same Source are told apart by this token,
+// which is what makes "the same phone reconnected" distinguishable from "a
+// different phone took over" -- for /api/status as well as for the tests.
+func (e *Engine) CurrentHolder() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.holderToken
 }
 
 // ActiveSource reports the current owner for /api/status.
@@ -180,9 +354,18 @@ func (e *Engine) ActiveSource() Source {
 	return e.active
 }
 
-// ClaimDLNA / ReleaseDLNA are the Player interface spellings of Claim/Release.
-func (e *Engine) ClaimDLNA() error { return e.Claim(SourceDLNA) }
-func (e *Engine) ReleaseDLNA()     { e.Release(SourceDLNA) }
+// ClaimDLNA / ReleaseDLNA are the Player interface spellings of the DLNA
+// source's arbitration.
+//
+// ClaimDLNA is preemptive: a UPnP controller pressing Play is a new cast, and a
+// new cast wins. Whatever held the card (a MiPlay cast in particular) is stopped
+// and waited for first, so the two can never stream into one exclusive device.
+func (e *Engine) ClaimDLNA() error {
+	return e.Acquire(context.Background(), Holder{Source: SourceDLNA, Peer: "dlna", Token: "dlna"})
+}
+
+// ReleaseDLNA frees the DLNA slot if DLNA still owns it.
+func (e *Engine) ReleaseDLNA() { e.Release(SourceDLNA) }
 
 // ---------------------------------------------------------------------------
 // Kernel surface (Player implementation + API primitives)

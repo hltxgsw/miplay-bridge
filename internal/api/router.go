@@ -10,6 +10,8 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -94,6 +96,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/healthz", s.healthz)
 
 	mux.HandleFunc("GET /api/status", s.guard(s.status))
+	mux.HandleFunc("GET /api/events", s.guard(s.events))
 	mux.HandleFunc("GET /api/devices", s.guard(s.devices))
 	mux.HandleFunc("POST /api/play", s.guard(s.play))
 	mux.HandleFunc("POST /api/control", s.guard(s.control))
@@ -192,6 +195,15 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// Flush forwards to the wrapped writer. Without this the logging wrapper would
+// hide the underlying http.Flusher and the SSE endpoint (which type-asserts on
+// it) would refuse to stream.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -373,16 +385,22 @@ func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 
 // status returns the full bridge status.
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.statusPayload(r.Context()))
+}
+
+// statusPayload builds the /api/status body. The SSE stream shares it so the
+// console's first paint and every pushed frame are the same object.
+func (s *Server) statusPayload(ctx context.Context) map[string]any {
 	mixerState := alsa.State{}
 	if s.mixer != nil {
 		mixerState = s.mixer.State()
 	}
 	kernel := s.kernelSnapshot()
-	playback, err := s.playbackSnapshot(r.Context())
+	playback, err := s.playbackSnapshot(ctx)
 	if err != nil {
 		playback = map[string]any{"state": "unknown", "error": err.Error()}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"success":         true,
 		"service_online":  true,
 		"version":         Version,
@@ -395,7 +413,70 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"active_source":   s.activeSource(),
 		"miplay":          s.miplayStatus(),
 		"dlna":            s.dlnaStatus(),
-	})
+	}
+}
+
+// eventsInterval is how often the SSE stream re-sends a snapshot. One second
+// matches the polling cadence the console used before, minus a request
+// round-trip per tick; the frontend interpolates the playhead locally between
+// frames so the progress bar still moves smoothly.
+const eventsInterval = time.Second
+
+// events streams the /api/status snapshot as Server-Sent Events.
+//
+// SSE rather than WebSocket: the console needs one-way pushes only, and a plain
+// text/event-stream response adds no dependency and no upgrade handshake to a
+// container that must stay "one docker run" simple. The page consumes it with
+// fetch()+ReadableStream because EventSource cannot attach the x-bridge-token
+// header, and falls back to polling when streaming is unavailable.
+func (s *Server) events(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "server does not support streaming responses", "stream_unsupported")
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-store")
+	header.Set("Connection", "keep-alive")
+	// Reverse proxies buffer by default, which would hold every frame until the
+	// stream closed and make the console look frozen.
+	header.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	ctx := r.Context()
+	// Prime the client immediately: the first paint must not wait a tick.
+	if !writeStatusEvent(w, s.statusPayload(ctx)) {
+		return
+	}
+	flusher.Flush()
+
+	ticker := time.NewTicker(eventsInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !writeStatusEvent(w, s.statusPayload(ctx)) {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// writeStatusEvent emits one SSE frame and reports whether the client is still
+// connected.
+func writeStatusEvent(w io.Writer, payload map[string]any) bool {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	if _, err := fmt.Fprintf(w, "event: status\ndata: %s\n\n", encoded); err != nil {
+		return false
+	}
+	return true
 }
 
 // miplayStatus is the MiPlay slice of /api/status.

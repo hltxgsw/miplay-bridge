@@ -7,7 +7,12 @@ import (
 )
 
 // maxRTSPMessage bounds one RTSP message during the WFD handshake.
-const maxRTSPMessage = 256 * 1024
+//
+// MiUI 的 WFD 握手请求（携带 SDP 与 Safety 密钥材料）在实测中可超过 256 KiB；
+// 原 256 KiB 上限会把合法握手误判为超限，缓冲区被清空并直接断开控制连接，
+// 表现为「手机能看到设备、点播放后建连成功但没有任何声音」，随后设备从列表消失。
+// 4 MiB 足以覆盖真实握手体积，同时仍保留有界的内存上限。
+const maxRTSPMessage = 4 * 1024 * 1024
 
 // rtspHeader is one ordered RTSP header.
 type rtspHeader struct {
@@ -66,10 +71,51 @@ func EncodeRTSP(message RTSPMessage) ([]byte, error) {
 // RTSPDecoder incrementally splits a TCP stream into RTSP messages.
 type RTSPDecoder struct {
 	buffer []byte
+	// mediaSink 接收从控制腿上剥下来的媒体帧载荷。MiUI 把媒体帧混写在 RTSP
+	// 控制连接里（10-04 实测），解码器必须剥出来交给播放管线，否则全程无声。
+	// 为 nil 时媒体帧被静默丢弃（保留旧行为，供只关心 RTSP 的调用方使用）。
+	mediaSink func([]byte)
 }
+
+// SetMediaSink registers the consumer for media frames stripped off the control
+// leg. The payload is the frame body without the 0x24 magic and length prefix.
+func (d *RTSPDecoder) SetMediaSink(sink func([]byte)) { d.mediaSink = sink }
 
 // NewRTSPDecoder returns an empty decoder.
 func NewRTSPDecoder() *RTSPDecoder { return &RTSPDecoder{buffer: make([]byte, 0, 4096)} }
+
+// skipMediaFrame drops one interleaved media frame (0x24 magic + 3-byte big-endian
+// length + payload) from the front of the buffer. It reports whether a full frame
+// was consumed.
+//
+// It returns false in two distinct cases, told apart by len(d.buffer):
+//   - len(buffer) < MediaHeaderSize or a full frame not buffered yet → incomplete,
+//     caller must wait for more bytes before deciding anything.
+//   - magic present but length invalid (0 or above MaxMediaPayload) → not a media
+//     frame at all, caller falls through to RTSP parsing which fails loudly.
+func (d *RTSPDecoder) skipMediaFrame() bool {
+	if len(d.buffer) < MediaHeaderSize {
+		return false
+	}
+	length := int(d.buffer[1])<<16 | int(d.buffer[2])<<8 | int(d.buffer[3])
+	if length == 0 || length > MaxMediaPayload {
+		return false
+	}
+	frameLength := MediaHeaderSize + length
+	if len(d.buffer) < frameLength {
+		return false // 半帧：留到下次 Feed 补齐
+	}
+	// 先交给 sink 再推进 buffer：载荷必须拷贝一份，因为 d.buffer 会被
+	// append 复用（append(d.buffer[:0], ...) 原地搬移），直接传切片会
+	// 让下游拿到正在被覆盖的内存。
+	if d.mediaSink != nil {
+		payload := make([]byte, length)
+		copy(payload, d.buffer[MediaHeaderSize:frameLength])
+		d.mediaSink(payload)
+	}
+	d.buffer = append(d.buffer[:0], d.buffer[frameLength:]...)
+	return true
+}
 
 // Feed appends data and returns every complete message.
 func (d *RTSPDecoder) Feed(data []byte) ([]RTSPMessage, error) {
@@ -80,14 +126,67 @@ func (d *RTSPDecoder) Feed(data []byte) ([]RTSPMessage, error) {
 	}
 	messages := []RTSPMessage{}
 	for {
+		// 跳过媒体帧后 buffer 可能被清空，下一轮不能直接索引 buffer[0]。
+		if len(d.buffer) == 0 {
+			break
+		}
+		// MiUI 不保证「第一条连接只走 RTSP 控制」。实测（10-04，小米手機投送）：
+		// 接收端按连接序号假定 connections[0]=RTSP、connections[2]=媒体，但手机会把
+		// 媒体帧（0x24 帧头）也写到这条连接上。若不识别，这些二进制会被当成 RTSP
+		// 文本解析，撞到 >0x7F 字节后 decodeASCII 报错、控制腿断开 → 能连上却全程
+		// 无声、设备随后从列表消失。
+		// 这里先按媒体帧头分流：完整帧直接丢弃（媒体由 mediaConnection 那条腿负责），
+		// 残帧留到下一批数据补齐后再判断。
+		if d.buffer[0] == MediaMagic {
+			if d.skipMediaFrame() {
+				continue // 丢掉一整帧，继续看下一段
+			}
+			// 帧不完整（半帧）或长度非法。半帧必须等下一批数据补齐，不能继续往下
+			// 解析，否则残帧会被当 RTSP 文本读到 >0x7F 字节而误报错。
+			if len(d.buffer) < MediaHeaderSize {
+				return messages, nil
+			}
+			length := int(d.buffer[1])<<16 | int(d.buffer[2])<<8 | int(d.buffer[3])
+			if length == 0 || length > MaxMediaPayload {
+				// 帧头是 0x24 但长度非法 → 这不是媒体帧也不是合法 RTSP 头。
+				// 丢掉这个字节让下面的 RTSP 解析去发现真正的协议违规；直接 return 会
+				// 把非法输入留在 buffer 里静默吞掉，掩盖问题。
+				d.buffer = d.buffer[1:]
+				continue
+			}
+			return messages, nil // 合法长度但还没收满，等补齐
+		}
 		headerEnd := indexOfDoubleCRLF(d.buffer)
 		if headerEnd < 0 {
 			break
 		}
 		head, err := decodeASCII(d.buffer[:headerEnd])
 		if err != nil {
+			// 取证：把首个非 ASCII 字节的偏移/值与上下文带进错误信息。
+			// 原实现只报「not ASCII」，无法判断究竟是哪一段数据（设备名、元数据、
+			// 还是二进制内容）触发，排查时只能靠猜。truncateForLog 已做安全截断。
+			headRaw := d.buffer[:headerEnd] // 错误返回前 buffer 会被清空，先留引用
+			off, val := -1, byte(0)
+			for i, v := range headRaw {
+				if v > 0x7F {
+					off, val = i, v
+					break
+				}
+			}
+			if off < 0 {
+				off = 0
+			}
+			lo := off - 24
+			if lo < 0 {
+				lo = 0
+			}
+			hi := off + 24
+			if hi > len(headRaw) {
+				hi = len(headRaw)
+			}
 			d.buffer = d.buffer[:0]
-			return nil, protocolErrorf("RTSP headers are not ASCII")
+			return nil, protocolErrorf("RTSP headers are not ASCII (offset %d/%d, byte 0x%02x, ctx %q)",
+				off, len(headRaw), val, truncateForLog(string(headRaw[lo:hi]), 120))
 		}
 		lines := strings.Split(head, "\r\n")
 		if len(lines) == 0 || lines[0] == "" {
